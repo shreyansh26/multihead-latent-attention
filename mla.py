@@ -6,18 +6,6 @@ from model_config import ModelConfigMLA
 from rope import precompute_freqs_cis, apply_rotary_emb
 from attention import naive_attention
 
-"""
-Variable suufix nomenclature:
-
-b: batch size
-q: number of query heads
-k: number of key/value heads
-s: sequence length (query)
-l: sequence length (key/value)
-d: model dimension
-h: head dimension
-"""
-
 class MLA(nn.Module):
     """
     Class to implement Multi-Head Latent Attention. 
@@ -36,7 +24,7 @@ class MLA(nn.Module):
         self.register_buffer('freqs_cis_qk', freqs_cis_qk, persistent=False)
 
         self.w_dkv = nn.Linear(model_config.dim, model_config.kv_lora_rank, bias=False, dtype=dtype)
-        self.w_kr = nn.Linear(model_config.kv_lora_rank, self.qk_rope_head_dim, bias=False, dtype=dtype)
+        self.w_kr = nn.Linear(model_config.dim, self.qk_rope_head_dim, bias=False, dtype=dtype)
         self.w_uk = nn.Linear(model_config.kv_lora_rank, self.num_key_value_heads * self.qk_nope_head_dim, bias=False, dtype=dtype)
         self.w_uv = nn.Linear(model_config.kv_lora_rank, self.num_key_value_heads * self.v_head_dim, bias=False, dtype=dtype)
 
@@ -52,10 +40,6 @@ class MLA(nn.Module):
         
         c_kv = self.w_dkv(x_bsd) # [B, S, kv_lora_rank]
         c_q = self.w_dq(x_bsd) # [B, S, q_lora_rank]
-
-        # Not needed to be done explicitly
-        # k_c = self.w_uk(c_kv)
-        # v_c = self.w_uv(c_kv)
 
         k_r = self.w_kr(x_bsd) # [B, S, qk_rope_head_dim]
         k_r = k_r.view(batch_size, seq_len, 1, self.qk_rope_head_dim)
@@ -84,9 +68,6 @@ class MLA(nn.Module):
         v = v.view(batch_size, seq_len, self.num_key_value_heads, self.v_head_dim)
         v = v.transpose(1, 2) # [B, num_key_value_heads, S, v_head_dim]
 
-        # k = k.repeat_interleave(self.num_kv_groups, dim=1)
-        # v = v.repeat_interleave(self.num_kv_groups, dim=1)
-
         out_bsd = naive_attention(q, k, v, is_causal=is_causal)
         out_bsd = self.w_o(out_bsd)
 
@@ -100,7 +81,7 @@ if __name__ == "__main__":
         qk_rope_head_dim=64,
         qk_nope_head_dim=128,
         v_head_dim=128,
-        num_key_value_heads=129,
+        num_key_value_heads=128,
         num_attention_heads=128,
         max_seq_len=163840,
     )
