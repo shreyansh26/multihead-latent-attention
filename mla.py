@@ -56,11 +56,11 @@ class MLA(nn.Module):
         q_r = self.w_qr(c_q) # [B, S, num_attention_heads * qk_rope_head_dim]
         q_r = q_r.view(batch_size, seq_len, self.num_attention_heads, self.qk_rope_head_dim)
         q_r = apply_rotary_emb(q_r, self.freqs_cis_qk)
-        q_r = q_r.transpose(1, 2) #[B, num_attention_heads, S, qk_rope_head_dim]
+        q_r = q_r.transpose(1, 2) # [B, num_attention_heads, S, qk_rope_head_dim]
 
         q_n = self.w_uq(c_q) # [B, S, num_attention_heads * qk_nope_head_dim]
         q_n = q_n.view(batch_size, seq_len, self.num_attention_heads, self.qk_nope_head_dim)
-        q_n = q_n.transpose(1, 2) #[B, num_attention_heads, S, qk_nope_head_dim]
+        q_n = q_n.transpose(1, 2) # [B, num_attention_heads, S, qk_nope_head_dim]
         
         q = torch.cat([q_r, q_n], dim=-1) # [B, num_attention_heads, S, (qk_rope_head_dim + qk_nope_head_dim)]
 
