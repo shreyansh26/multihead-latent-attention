@@ -73,7 +73,7 @@ class MLA(nn.Module):
 
         return out_bsd
 
-class MLAGrouped(nn.Module):
+class MLAFused(nn.Module):
     """
     Class to implement Multi-Head Latent Attention. 
     """
@@ -164,8 +164,8 @@ if __name__ == "__main__":
     out_bsd = model(x_bsd)
     print(out_bsd.shape)
 
-    # MLA Grouped
-    model = MLAGrouped(model_config_mla, dtype=dtype).to(device)
+    # MLA Fused
+    model = MLAFused(model_config_mla, dtype=dtype).to(device)
     x_bsd = torch.randn(batch_size, seq_len, model_config_mla.dim, dtype=dtype).to(device)
     out_bsd = model(x_bsd)
     print(out_bsd.shape)
