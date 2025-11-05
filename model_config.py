@@ -5,6 +5,7 @@ class ModelConfig:
     d_model: int
     num_heads: int
     num_kv_heads: int
+    head_dim: int
     max_seq_len: int
 
 @dataclass
