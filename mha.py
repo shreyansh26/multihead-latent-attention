@@ -30,11 +30,12 @@ class MHA(nn.Module):
         assert model_config.d_model % model_config.num_kv_heads == 0
 
         self.d_model = model_config.d_model
+        self.head_dim = model_config.head_dim
         self.num_heads = model_config.num_heads
         self.num_kv_heads = model_config.num_kv_heads
 
         self.num_kv_groups = model_config.num_heads // model_config.num_kv_heads
-        self.head_dim = model_config.d_model // model_config.num_heads
+
         freqs_cis = precompute_freqs_cis(self.head_dim, model_config.max_seq_len)
         self.register_buffer('freqs_cis', freqs_cis, persistent=False)
 
@@ -43,7 +44,7 @@ class MHA(nn.Module):
         self.v_proj = nn.Linear(self.d_model, self.num_kv_heads * self.head_dim, bias=False, dtype=dtype)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.d_model,bias=False, dtype=dtype)
 
-    def forward(self, x_bsd, is_causal=False, return_torch_ref=False):
+    def forward(self, x_bsd, is_causal=False, kv_cache=None, return_torch_ref=False):
         batch_size, seq_len, d_model = x_bsd.shape
         new_shape = (batch_size, seq_len, -1, self.head_dim) # -1 because num_heads or num_kv_heads
         q_bsqh = self.q_proj(x_bsd).view(new_shape)
@@ -70,24 +71,27 @@ class MHA(nn.Module):
 
 if __name__ == "__main__":
     model_config_mha = ModelConfig(
-        d_model=8192,
-        num_heads=8,
-        num_kv_heads=8,
-        max_seq_len=4096,
+        d_model=4096,
+        num_heads=32,
+        num_kv_heads=32,
+        head_dim=128,
+        max_seq_len=4096
     )
 
     model_config_gqa = ModelConfig(
-        d_model=8192,
-        num_heads=8,
-        num_kv_heads=4,
-        max_seq_len=4096,
+        d_model=4096,
+        num_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        max_seq_len=4096
     )
 
     model_config_mqa = ModelConfig(
-        d_model=8192,
-        num_heads=8,
+        d_model=4096,
+        num_heads=32,
         num_kv_heads=1,
-        max_seq_len=4096,
+        head_dim=128,
+        max_seq_len=4096
     )
 
     dtype = torch.float32
