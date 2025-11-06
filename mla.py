@@ -35,7 +35,7 @@ class MLA(nn.Module):
         self.w_o = nn.Linear(self.num_attention_heads * self.v_head_dim, model_config.dim, bias=False, dtype=dtype)
         
 
-    def forward(self, x_bsd, is_causal=False):
+    def forward(self, x_bsd, cache=None, is_causal=False):
         batch_size, seq_len, d_model = x_bsd.shape
         
         c_kv = self.w_dkv(x_bsd) # [B, S, kv_lora_rank]
@@ -45,10 +45,16 @@ class MLA(nn.Module):
         k_r = k_r.view(batch_size, seq_len, 1, self.qk_rope_head_dim)
         k_r = apply_rotary_emb(k_r, self.freqs_cis_qk)
         k_r = k_r.transpose(1, 2) # [B, 1, S, qk_rope_head_dim]
+
+        if cache is not None:
+            c_kv = cache.compressed_kv.update(c_kv)
+            k_r = cache.k_rope.update(k_r)
+
+        seq_len_kv = c_kv.shape[1]  # Use actual KV sequence length (may differ from query seq_len when using cache)
         k_r = k_r.repeat_interleave(self.num_key_value_heads, dim=1) # [B, num_key_value_heads, S, qk_rope_head_dim]
 
         k_n = self.w_uk(c_kv) # [B, S, num_key_value_heads * qk_nope_head_dim]
-        k_n = k_n.view(batch_size, seq_len, self.num_key_value_heads, self.qk_nope_head_dim)
+        k_n = k_n.view(batch_size, seq_len_kv, self.num_key_value_heads, self.qk_nope_head_dim)
         k_n = k_n.transpose(1, 2) # [B, num_key_value_heads, S, qk_nope_head_dim]
 
         k = torch.cat([k_r, k_n], dim=-1) # [B, num_key_value_heads, S, (qk_rope_head_dim + qk_nope_head_dim)]
@@ -65,7 +71,7 @@ class MLA(nn.Module):
         q = torch.cat([q_r, q_n], dim=-1) # [B, num_attention_heads, S, (qk_rope_head_dim + qk_nope_head_dim)]
 
         v = self.w_uv(c_kv) # [B, S, num_key_value_heads * v_head_dim]
-        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.v_head_dim)
+        v = v.view(batch_size, seq_len_kv, self.num_key_value_heads, self.v_head_dim)
         v = v.transpose(1, 2) # [B, num_key_value_heads, S, v_head_dim]
 
         out_bsd = naive_attention(q, k, v, is_causal=is_causal)
@@ -100,7 +106,7 @@ class MLAFused(nn.Module):
         self.w_o = nn.Linear(self.num_attention_heads * self.v_head_dim, model_config.dim, bias=False, dtype=dtype)
         
 
-    def forward(self, x_bsd, is_causal=False):
+    def forward(self, x_bsd, cache=None, is_causal=False):
         batch_size, seq_len, d_model = x_bsd.shape
         
         c_q = self.w_dq(x_bsd) # [B, S, q_lora_rank]
@@ -111,16 +117,22 @@ class MLAFused(nn.Module):
         k_r = k_r.view(batch_size, seq_len, 1, self.qk_rope_head_dim)
         k_r = apply_rotary_emb(k_r, self.freqs_cis_qk)
         k_r = k_r.transpose(1, 2) # [B, 1, S, qk_rope_head_dim]
+
+        if cache is not None:
+            c_kv = cache.compressed_kv.update(c_kv)
+            k_r = cache.k_rope.update(k_r)
+
+        seq_len_kv = c_kv.shape[1]  # Use actual KV sequence length (may differ from query seq_len when using cache)
         k_r = k_r.repeat_interleave(self.num_key_value_heads, dim=1) # [B, num_key_value_heads, S, qk_rope_head_dim]
 
         k_n_v = self.w_uk_uv(c_kv) # [B, S, num_key_value_heads * (qk_nope_head_dim + v_head_dim)]
         k_n, v = torch.split(k_n_v, [self.num_key_value_heads * self.qk_nope_head_dim, self.num_key_value_heads * self.v_head_dim], dim=-1) # [B, S, num_key_value_heads * qk_nope_head_dim], [B, S, num_key_value_heads * v_head_dim]
-        k_n = k_n.view(batch_size, seq_len, self.num_key_value_heads, self.qk_nope_head_dim)
+        k_n = k_n.view(batch_size, seq_len_kv, self.num_key_value_heads, self.qk_nope_head_dim)
         k_n = k_n.transpose(1, 2) # [B, num_key_value_heads, S, qk_nope_head_dim]
 
         k = torch.cat([k_r, k_n], dim=-1) # [B, num_key_value_heads, S, (qk_rope_head_dim + qk_nope_head_dim)]
 
-        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.v_head_dim)
+        v = v.view(batch_size, seq_len_kv, self.num_key_value_heads, self.v_head_dim)
         v = v.transpose(1, 2) # [B, num_key_value_heads, S, v_head_dim]
 
         q_r_q_n = self.w_qr_uq(c_q) # [B, S, num_attention_heads * (qk_rope_head_dim + qk_nope_head_dim)]
@@ -141,6 +153,8 @@ class MLAFused(nn.Module):
         return out_bsd
 
 if __name__ == "__main__":
+    from cache import CacheMLA
+    
     model_config_mla = ModelConfigMLA(
         dim=7168,
         q_lora_rank=1536,
@@ -162,10 +176,45 @@ if __name__ == "__main__":
     model = MLA(model_config_mla, dtype=dtype).to(device)
     x_bsd = torch.randn(batch_size, seq_len, model_config_mla.dim, dtype=dtype).to(device)
     out_bsd = model(x_bsd)
-    print(out_bsd.shape)
+    print(f"MLA output shape: {out_bsd.shape}")
+
+    ## MLA - Simulate inference using Cache
+    prefill_len = 128
+    decode_steps = 16
+    
+    model = MLA(model_config_mla, dtype=dtype).to(device)
+    cache = CacheMLA(batch_size, prefill_len + decode_steps, model_config_mla, dtype=dtype, device=device)
+    
+    # Prefill
+    x_prefill = torch.randn(batch_size, prefill_len, model_config_mla.dim, dtype=dtype).to(device)
+    _ = model(x_prefill, cache=cache, is_causal=True)
+    
+    # Decode loop (sequence length = 1 per step)
+    for _ in range(decode_steps):
+        x_decode = torch.randn(batch_size, 1, model_config_mla.dim, dtype=dtype).to(device)
+        _ = model(x_decode, cache=cache, is_causal=True)
+    
+    assert cache.pos == prefill_len + decode_steps
+    print("MLA cache inference simulation: prefill + decode loop completed.")
 
     # MLA Fused
     model = MLAFused(model_config_mla, dtype=dtype).to(device)
     x_bsd = torch.randn(batch_size, seq_len, model_config_mla.dim, dtype=dtype).to(device)
     out_bsd = model(x_bsd)
-    print(out_bsd.shape)
+    print(f"MLAFused output shape: {out_bsd.shape}")
+    
+    ## MLAFused - Simulate inference using Cache
+    model = MLAFused(model_config_mla, dtype=dtype).to(device)
+    cache = CacheMLA(batch_size, prefill_len + decode_steps, model_config_mla, dtype=dtype, device=device)
+    
+    # Prefill
+    x_prefill = torch.randn(batch_size, prefill_len, model_config_mla.dim, dtype=dtype).to(device)
+    _ = model(x_prefill, cache=cache, is_causal=True)
+    
+    # Decode loop (sequence length = 1 per step)
+    for _ in range(decode_steps):
+        x_decode = torch.randn(batch_size, 1, model_config_mla.dim, dtype=dtype).to(device)
+        _ = model(x_decode, cache=cache, is_causal=True)
+    
+    assert cache.pos == prefill_len + decode_steps
+    print("MLAFused cache inference simulation: prefill + decode loop completed.")
