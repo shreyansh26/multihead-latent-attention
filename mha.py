@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from model_config import ModelConfig
 from rope import precompute_freqs_cis, apply_rotary_emb
 from attention import naive_attention, sdpa_attention
+from cache import KVCacheMHA
 
 """
 Variable suufix nomenclature:
@@ -57,8 +58,14 @@ class MHA(nn.Module):
         q_bqsh = q_bsqh.transpose(1, 2)
         k_bklh = k_blkh.transpose(1, 2)
         v_bklh = v_blkh.transpose(1, 2)
+
+        if kv_cache is not None:
+            k_bklh_updated, v_bklh_updated = kv_cache.update(k_bklh, v_bklh)
+            k_bklh = k_bklh_updated
+            v_bklh = v_bklh_updated
         
         out_bsd = naive_attention(q_bqsh, k_bklh, v_bklh, is_causal=is_causal)
+        # out_bsd = sdpa_attention(q_bqsh, k_bklh, v_bklh, is_causal=is_causal)
         out_bsd = self.o_proj(out_bsd)
 
         # Torch implementation
@@ -143,3 +150,22 @@ if __name__ == "__main__":
 
     # del model, x_bsd, out_bsd, out_bsd_torch
     # torch.cuda.empty_cache()
+
+    ## Inference simulation using KV Cache
+    prefill_len = 128
+    decode_steps = 16
+
+    model = MHA(model_config_gqa, dtype=dtype).to(device)
+    kv_cache = KVCacheMHA(batch_size, model_config_gqa.max_seq_len, model_config_gqa, dtype=dtype, device=device)
+
+    # Prefill
+    x_prefill = torch.randn(batch_size, prefill_len, model_config_gqa.d_model, dtype=dtype).to(device)
+    _ = model(x_prefill, is_causal=True, kv_cache=kv_cache)
+
+    # Decode loop (sequence length = 1 per step)
+    for _ in range(decode_steps):
+        x_decode = torch.randn(batch_size, 1, model_config_gqa.d_model, dtype=dtype).to(device)
+        _ = model(x_decode, is_causal=True, kv_cache=kv_cache)
+
+    assert kv_cache.pos == prefill_len + decode_steps
+    print("KV-cache inference simulation: prefill + decode loop completed.")
