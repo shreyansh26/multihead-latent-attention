@@ -5,7 +5,7 @@ def naive_attention(q_bqsh, k_bklh, v_bklh, is_causal=False):
     """
     Naive attention implementation.
     """
-    batch_size, seq_len = k_bklh.shape[0], k_bklh.shape[2]
+    batch_size, seq_len = q_bqsh.shape[0], q_bqsh.shape[2]
     head_dim = q_bqsh.shape[-1]
     num_heads = q_bqsh.shape[1]
     num_kv_heads = k_bklh.shape[1]
@@ -29,7 +29,7 @@ def sdpa_attention(q_bqsh, k_bklh, v_bklh, is_causal=False):
     """
     SDPA attention implementation.
     """
-    batch_size, seq_len = k_bklh.shape[0], k_bklh.shape[2]
+    batch_size, seq_len = q_bqsh.shape[0], q_bqsh.shape[2]
     num_heads = q_bqsh.shape[1]
     num_kv_heads = k_bklh.shape[1]
     num_kv_groups = num_heads // num_kv_heads
