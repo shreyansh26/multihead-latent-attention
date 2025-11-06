@@ -156,7 +156,7 @@ if __name__ == "__main__":
     decode_steps = 16
 
     model = MHA(model_config_gqa, dtype=dtype).to(device)
-    kv_cache = KVCacheMHA(batch_size, model_config_gqa.max_seq_len, model_config_gqa, dtype=dtype, device=device)
+    kv_cache = KVCacheMHA(batch_size, prefill_len + decode_steps, model_config_gqa, dtype=dtype, device=device)
 
     # Prefill
     x_prefill = torch.randn(batch_size, prefill_len, model_config_gqa.d_model, dtype=dtype).to(device)
