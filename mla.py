@@ -152,6 +152,92 @@ class MLAFused(nn.Module):
 
         return out_bsd
 
+class MLAFusedAbsorbed(nn.Module):
+    """
+    Multi-Head Latent Attention with Absorption optimization.
+    W^{UK} is absorbed into query projection, W^{UV} is absorbed into output projection.
+    This avoids materializing decompressed K/V during inference.
+    """
+    def __init__(self, model_config: ModelConfigMLA, dtype=torch.bfloat16):
+        super().__init__()
+        self.qk_rope_head_dim = model_config.qk_rope_head_dim
+        self.kv_lora_rank = model_config.kv_lora_rank
+        self.seq_len = model_config.max_seq_len
+        self.num_key_value_heads = model_config.num_key_value_heads
+        self.num_attention_heads = model_config.num_attention_heads
+        self.num_kv_groups = self.num_attention_heads // self.num_key_value_heads
+
+        freqs_cis_qk = precompute_freqs_cis(self.qk_rope_head_dim, self.seq_len)
+        self.register_buffer('freqs_cis_qk', freqs_cis_qk, persistent=False)
+
+        # KV compression path
+        self.w_dkv = nn.Linear(model_config.dim, model_config.kv_lora_rank, bias=False, dtype=dtype)
+        self.w_kr = nn.Linear(model_config.dim, self.qk_rope_head_dim, bias=False, dtype=dtype)
+
+        # Query path with absorption
+        self.w_dq = nn.Linear(model_config.dim, model_config.q_lora_rank, bias=False, dtype=dtype)
+        self.w_qr = nn.Linear(model_config.q_lora_rank, self.num_attention_heads * self.qk_rope_head_dim, bias=False, dtype=dtype)
+        # Absorbed query nope: projects to kv_lora_rank per head (to score against c^{KV})
+        self.w_uq_absorbed = nn.Linear(model_config.q_lora_rank, self.num_attention_heads * self.kv_lora_rank, bias=False, dtype=dtype)
+
+        # Absorbed output projection: operates on kv_lora_rank per head
+        self.w_o_absorbed = nn.Linear(self.num_attention_heads * self.kv_lora_rank, model_config.dim, bias=False, dtype=dtype)
+
+    def forward(self, x_bsd, cache=None, is_causal=False):
+        batch_size, seq_len, d_model = x_bsd.shape
+        
+        # Compress KV
+        c_kv = self.w_dkv(x_bsd) # [B, S, kv_lora_rank]
+        c_q = self.w_dq(x_bsd) # [B, S, q_lora_rank]
+
+        # RoPE key component
+        k_r = self.w_kr(x_bsd) # [B, S, qk_rope_head_dim]
+        k_r = k_r.view(batch_size, seq_len, 1, self.qk_rope_head_dim)
+        k_r = apply_rotary_emb(k_r, self.freqs_cis_qk)
+        k_r = k_r.transpose(1, 2) # [B, 1, S, qk_rope_head_dim]
+
+        # Cache update
+        if cache is not None:
+            c_kv = cache.compressed_kv.update(c_kv)
+            k_r = cache.k_rope.update(k_r)
+
+        seq_len_kv = c_kv.shape[1]
+        
+        # Broadcast RoPE key to all key_value_heads
+        k_r = k_r.repeat_interleave(self.num_key_value_heads, dim=1) # [B, num_key_value_heads, S, qk_rope_head_dim]
+
+        # Key nope is c_kv directly (broadcasted to all key_value_heads)
+        # Shape: [B, S, kv_lora_rank] -> [B, num_key_value_heads, S, kv_lora_rank]
+        k_n = c_kv.unsqueeze(1).expand(batch_size, self.num_key_value_heads, seq_len_kv, self.kv_lora_rank)
+        
+        # Concatenate RoPE and nope components for key
+        k = torch.cat([k_r, k_n], dim=-1) # [B, num_key_value_heads, S, (qk_rope_head_dim + kv_lora_rank)]
+
+        # RoPE query component
+        q_r = self.w_qr(c_q) # [B, S, num_attention_heads * qk_rope_head_dim]
+        q_r = q_r.view(batch_size, seq_len, self.num_attention_heads, self.qk_rope_head_dim)
+        q_r = apply_rotary_emb(q_r, self.freqs_cis_qk)
+        q_r = q_r.transpose(1, 2) # [B, num_attention_heads, S, qk_rope_head_dim]
+
+        # Absorbed query nope: (W^{UK})^T @ W^{UQ} @ c_q
+        q_n = self.w_uq_absorbed(c_q) # [B, S, num_attention_heads * kv_lora_rank]
+        q_n = q_n.view(batch_size, seq_len, self.num_attention_heads, self.kv_lora_rank)
+        q_n = q_n.transpose(1, 2) # [B, num_attention_heads, S, kv_lora_rank]
+        
+        # Concatenate RoPE and absorbed nope components for query
+        q = torch.cat([q_r, q_n], dim=-1) # [B, num_attention_heads, S, (qk_rope_head_dim + kv_lora_rank)]
+
+        # Value is c_kv directly (broadcasted to all key_value_heads)
+        v = c_kv.unsqueeze(1).expand(batch_size, self.num_key_value_heads, seq_len_kv, self.kv_lora_rank)
+
+        # Attention with absorbed dimensions
+        out_bsd = naive_attention(q, k, v, is_causal=is_causal)
+        
+        # Absorbed output projection: W^O @ W^{UV}
+        out_bsd = self.w_o_absorbed(out_bsd)
+
+        return out_bsd
+
 if __name__ == "__main__":
     from cache import CacheMLA
     
@@ -218,3 +304,25 @@ if __name__ == "__main__":
     
     assert cache.pos == prefill_len + decode_steps
     print("MLAFused cache inference simulation: prefill + decode loop completed.")
+
+    # MLA Fused Absorbed
+    model = MLAFusedAbsorbed(model_config_mla, dtype=dtype).to(device)
+    x_bsd = torch.randn(batch_size, seq_len, model_config_mla.dim, dtype=dtype).to(device)
+    out_bsd = model(x_bsd)
+    print(f"MLAFusedAbsorbed output shape: {out_bsd.shape}")
+
+    ## MLAFusedAbsorbed - Simulate inference using Cache
+    model = MLAFusedAbsorbed(model_config_mla, dtype=dtype).to(device)
+    cache = CacheMLA(batch_size, prefill_len + decode_steps, model_config_mla, dtype=dtype, device=device)
+    
+    # Prefill
+    x_prefill = torch.randn(batch_size, prefill_len, model_config_mla.dim, dtype=dtype).to(device)
+    _ = model(x_prefill, cache=cache, is_causal=True)
+    
+    # Decode loop (sequence length = 1 per step)
+    for _ in range(decode_steps):
+        x_decode = torch.randn(batch_size, 1, model_config_mla.dim, dtype=dtype).to(device)
+        _ = model(x_decode, cache=cache, is_causal=True)
+    
+    assert cache.pos == prefill_len + decode_steps
+    print("MLAFusedAbsorbed cache inference simulation: prefill + decode loop completed.")
