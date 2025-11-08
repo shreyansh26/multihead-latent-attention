@@ -1,10 +1,11 @@
+import time
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from model_config import ModelConfigMLA
 from rope import precompute_freqs_cis, apply_rotary_emb
-from attention import naive_attention
+from attention import naive_attention, sdpa_attention
 
 class MLA(nn.Module):
     """
@@ -74,7 +75,8 @@ class MLA(nn.Module):
         v = v.view(batch_size, seq_len_kv, self.num_key_value_heads, self.v_head_dim)
         v = v.transpose(1, 2) # [B, num_key_value_heads, S, v_head_dim]
 
-        out_bsd = naive_attention(q, k, v, is_causal=is_causal)
+        # out_bsd = naive_attention(q, k, v, is_causal=is_causal)
+        out_bsd = sdpa_attention(q, k, v, is_causal=is_causal)
         out_bsd = self.w_o(out_bsd)
 
         return out_bsd
@@ -147,7 +149,8 @@ class MLAFused(nn.Module):
         
         q = torch.cat([q_r, q_n], dim=-1) # [B, num_attention_heads, S, (qk_rope_head_dim + qk_nope_head_dim)]
 
-        out_bsd = naive_attention(q, k, v, is_causal=is_causal)
+        # out_bsd = naive_attention(q, k, v, is_causal=is_causal)
+        out_bsd = sdpa_attention(q, k, v, is_causal=is_causal)
         out_bsd = self.w_o(out_bsd)
 
         return out_bsd
@@ -161,6 +164,7 @@ class MLAFusedAbsorbed(nn.Module):
     def __init__(self, model_config: ModelConfigMLA, dtype=torch.bfloat16):
         super().__init__()
         self.qk_rope_head_dim = model_config.qk_rope_head_dim
+        self.qk_nope_head_dim = model_config.qk_nope_head_dim
         self.kv_lora_rank = model_config.kv_lora_rank
         self.seq_len = model_config.max_seq_len
         self.num_key_value_heads = model_config.num_key_value_heads
@@ -171,8 +175,7 @@ class MLAFusedAbsorbed(nn.Module):
         self.register_buffer('freqs_cis_qk', freqs_cis_qk, persistent=False)
 
         # KV compression path
-        self.w_dkv = nn.Linear(model_config.dim, model_config.kv_lora_rank, bias=False, dtype=dtype)
-        self.w_kr = nn.Linear(model_config.dim, self.qk_rope_head_dim, bias=False, dtype=dtype)
+        self.w_dkv_kr = nn.Linear(model_config.dim, model_config.kv_lora_rank + self.qk_rope_head_dim, bias=False, dtype=dtype)
 
         # Query path with absorption
         self.w_dq = nn.Linear(model_config.dim, model_config.q_lora_rank, bias=False, dtype=dtype)
@@ -185,13 +188,14 @@ class MLAFusedAbsorbed(nn.Module):
 
     def forward(self, x_bsd, cache=None, is_causal=False):
         batch_size, seq_len, d_model = x_bsd.shape
+
+        c_q = self.w_dq(x_bsd) # [B, S, q_lora_rank]
         
         # Compress KV
-        c_kv = self.w_dkv(x_bsd) # [B, S, kv_lora_rank]
-        c_q = self.w_dq(x_bsd) # [B, S, q_lora_rank]
-
+        c_kv_kr = self.w_dkv_kr(x_bsd) # [B, S, kv_lora_rank + qk_rope_head_dim]
+        c_kv, k_r = torch.split(c_kv_kr, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) # [B, S, kv_lora_rank], [B, S, qk_rope_head_dim]
+        
         # RoPE key component
-        k_r = self.w_kr(x_bsd) # [B, S, qk_rope_head_dim]
         k_r = k_r.view(batch_size, seq_len, 1, self.qk_rope_head_dim)
         k_r = apply_rotary_emb(k_r, self.freqs_cis_qk)
         k_r = k_r.transpose(1, 2) # [B, 1, S, qk_rope_head_dim]
@@ -203,15 +207,15 @@ class MLAFusedAbsorbed(nn.Module):
 
         seq_len_kv = c_kv.shape[1]
         
-        # Broadcast RoPE key to all key_value_heads
-        k_r = k_r.repeat_interleave(self.num_key_value_heads, dim=1) # [B, num_key_value_heads, S, qk_rope_head_dim]
+        # Keep k_r as single head (MQA paradigm - shared across all query heads)
+        # k_r stays as [B, 1, S, qk_rope_head_dim]
 
-        # Key nope is c_kv directly (broadcasted to all key_value_heads)
-        # Shape: [B, S, kv_lora_rank] -> [B, num_key_value_heads, S, kv_lora_rank]
-        k_n = c_kv.unsqueeze(1).expand(batch_size, self.num_key_value_heads, seq_len_kv, self.kv_lora_rank)
+        # Key nope is c_kv directly as single head
+        # Shape: [B, S, kv_lora_rank] -> [B, 1, S, kv_lora_rank]
+        k_n = c_kv.unsqueeze(1)
         
-        # Concatenate RoPE and nope components for key
-        k = torch.cat([k_r, k_n], dim=-1) # [B, num_key_value_heads, S, (qk_rope_head_dim + kv_lora_rank)]
+        # Concatenate RoPE and nope components for key (single head)
+        k = torch.cat([k_r, k_n], dim=-1) # [B, 1, S, (qk_rope_head_dim + kv_lora_rank)]
 
         # RoPE query component
         q_r = self.w_qr(c_q) # [B, S, num_attention_heads * qk_rope_head_dim]
@@ -227,11 +231,12 @@ class MLAFusedAbsorbed(nn.Module):
         # Concatenate RoPE and absorbed nope components for query
         q = torch.cat([q_r, q_n], dim=-1) # [B, num_attention_heads, S, (qk_rope_head_dim + kv_lora_rank)]
 
-        # Value is c_kv directly (broadcasted to all key_value_heads)
-        v = c_kv.unsqueeze(1).expand(batch_size, self.num_key_value_heads, seq_len_kv, self.kv_lora_rank)
+        # Value is c_kv as single head (MQA paradigm - shared across all query heads)
+        v = c_kv.unsqueeze(1) # [B, 1, S, kv_lora_rank]
 
         # Attention with absorbed dimensions
-        out_bsd = naive_attention(q, k, v, is_causal=is_causal)
+        # out_bsd = naive_attention(q, k, v, is_causal=is_causal)
+        out_bsd = sdpa_attention(q, k, v, is_causal=is_causal)
         
         # Absorbed output projection: W^O @ W^{UV}
         out_bsd = self.w_o_absorbed(out_bsd)
@@ -254,20 +259,22 @@ if __name__ == "__main__":
     )
 
     dtype = torch.bfloat16
-    batch_size = 4
+    batch_size = 2
     device = "cuda"
     seq_len = 1024
+    prefill_len = 128
+    decode_steps = 1024
 
     # MLA
     model = MLA(model_config_mla, dtype=dtype).to(device)
     x_bsd = torch.randn(batch_size, seq_len, model_config_mla.dim, dtype=dtype).to(device)
+    time_start = time.time()
     out_bsd = model(x_bsd)
     print(f"MLA output shape: {out_bsd.shape}")
+    time_end = time.time()
+    print(f"MLA time: {time_end - time_start}")
 
     ## MLA - Simulate inference using Cache
-    prefill_len = 128
-    decode_steps = 16
-    
     model = MLA(model_config_mla, dtype=dtype).to(device)
     cache = CacheMLA(batch_size, prefill_len + decode_steps, model_config_mla, dtype=dtype, device=device)
     
@@ -276,19 +283,24 @@ if __name__ == "__main__":
     _ = model(x_prefill, cache=cache, is_causal=True)
     
     # Decode loop (sequence length = 1 per step)
+    time_start = time.time()
     for _ in range(decode_steps):
         x_decode = torch.randn(batch_size, 1, model_config_mla.dim, dtype=dtype).to(device)
         _ = model(x_decode, cache=cache, is_causal=True)
-    
+    time_end = time.time()
     assert cache.pos == prefill_len + decode_steps
     print("MLA cache inference simulation: prefill + decode loop completed.")
+    print(f"MLA DECODE-ONLY time: {time_end - time_start}")
 
     # MLA Fused
     model = MLAFused(model_config_mla, dtype=dtype).to(device)
     x_bsd = torch.randn(batch_size, seq_len, model_config_mla.dim, dtype=dtype).to(device)
+    time_start = time.time()
     out_bsd = model(x_bsd)
     print(f"MLAFused output shape: {out_bsd.shape}")
-    
+    time_end = time.time()
+    print(f"MLAFused time: {time_end - time_start}")
+
     ## MLAFused - Simulate inference using Cache
     model = MLAFused(model_config_mla, dtype=dtype).to(device)
     cache = CacheMLA(batch_size, prefill_len + decode_steps, model_config_mla, dtype=dtype, device=device)
@@ -297,19 +309,25 @@ if __name__ == "__main__":
     x_prefill = torch.randn(batch_size, prefill_len, model_config_mla.dim, dtype=dtype).to(device)
     _ = model(x_prefill, cache=cache, is_causal=True)
     
-    # Decode loop (sequence length = 1 per step)
+    # Time decode only
+    time_start = time.time()
     for _ in range(decode_steps):
         x_decode = torch.randn(batch_size, 1, model_config_mla.dim, dtype=dtype).to(device)
         _ = model(x_decode, cache=cache, is_causal=True)
+    time_end = time.time()
     
     assert cache.pos == prefill_len + decode_steps
     print("MLAFused cache inference simulation: prefill + decode loop completed.")
+    print(f"MLAFused DECODE-ONLY time: {time_end - time_start}")
 
     # MLA Fused Absorbed
     model = MLAFusedAbsorbed(model_config_mla, dtype=dtype).to(device)
     x_bsd = torch.randn(batch_size, seq_len, model_config_mla.dim, dtype=dtype).to(device)
+    time_start = time.time()
     out_bsd = model(x_bsd)
     print(f"MLAFusedAbsorbed output shape: {out_bsd.shape}")
+    time_end = time.time()
+    print(f"MLAFusedAbsorbed time: {time_end - time_start}")
 
     ## MLAFusedAbsorbed - Simulate inference using Cache
     model = MLAFusedAbsorbed(model_config_mla, dtype=dtype).to(device)
@@ -319,10 +337,13 @@ if __name__ == "__main__":
     x_prefill = torch.randn(batch_size, prefill_len, model_config_mla.dim, dtype=dtype).to(device)
     _ = model(x_prefill, cache=cache, is_causal=True)
     
-    # Decode loop (sequence length = 1 per step)
+    # Time decode only
+    time_start = time.time()
     for _ in range(decode_steps):
         x_decode = torch.randn(batch_size, 1, model_config_mla.dim, dtype=dtype).to(device)
         _ = model(x_decode, cache=cache, is_causal=True)
+    time_end = time.time()
     
     assert cache.pos == prefill_len + decode_steps
     print("MLAFusedAbsorbed cache inference simulation: prefill + decode loop completed.")
+    print(f"MLAFusedAbsorbed DECODE-ONLY time: {time_end - time_start}")
