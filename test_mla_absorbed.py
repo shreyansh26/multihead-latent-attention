@@ -13,8 +13,7 @@ def fuse_weights_for_absorption(mla, mla_absorbed):
     """
     with torch.no_grad():
         # Copy shared weights
-        mla_absorbed.w_dkv.weight.copy_(mla.w_dkv.weight)
-        mla_absorbed.w_kr.weight.copy_(mla.w_kr.weight)
+        mla_absorbed.w_dkv_kr.weight.copy_(torch.cat([mla.w_dkv.weight, mla.w_kr.weight], dim=0))
         mla_absorbed.w_dq.weight.copy_(mla.w_dq.weight)
         mla_absorbed.w_qr.weight.copy_(mla.w_qr.weight)
         
