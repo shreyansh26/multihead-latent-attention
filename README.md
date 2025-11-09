@@ -1,5 +1,7 @@
 ## Multi-Head Latent Attention (MLA)
 
+**Blog Link** - [https://shreyansh26.github.io/post/2025-11-08_multihead-latent-attention/](https://shreyansh26.github.io/post/2025-11-08_multihead-latent-attention/)
+
 A small, self-contained reference implementation of:
 - **MHA/GQA/MQA** in `mha.py`
 - **MLA** plus fused and absorbed variants in `mla.py`
